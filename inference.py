@@ -24,7 +24,7 @@ import httpx
 
 API_BASE_URL: str = os.environ.get("API_BASE_URL", "").rstrip("/")
 MODEL_NAME: str = os.environ.get("MODEL_NAME", "gpt-4o-mini")
-HF_TOKEN: str = os.environ.get("HF_TOKEN", "")
+HF_TOKEN: str = os.environ.get("HF_TOKEN") or os.environ.get("OPENAI_API_KEY", "")
 ENV_URL: str = os.environ.get("ENV_URL", "http://localhost:7860").rstrip("/")
 
 TASK_IDS = ["bug-detection", "security-audit", "comprehensive-review"]
