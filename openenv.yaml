@@ -1,0 +1,11 @@
+spec_version: 1
+name: code_review_env
+version: "1.0.0"
+description: >
+  A code review and security audit environment for training AI agents.
+  The agent identifies bugs, security vulnerabilities, and performance issues
+  across three tasks of increasing difficulty (easy → medium → hard).
+type: space
+runtime: fastapi
+app: server.app:app
+port: 7860
