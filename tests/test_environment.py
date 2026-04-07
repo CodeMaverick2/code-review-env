@@ -838,3 +838,56 @@ class TestFunctionRanges:
     def test_function_ranges_nonempty_for_python(self, env):
         obs = env.reset(task_id="bug-detection")
         assert len(obs.code_metadata["function_ranges"]) > 0
+
+
+# ---------------------------------------------------------------------------
+# Diversity bonus
+# ---------------------------------------------------------------------------
+
+class TestDiversityBonus:
+    def test_first_tp_in_category_gets_diversity_bonus(self, env):
+        """First TP in a new issue category should include diversity_bonus."""
+        env.reset(task_id="security-audit")
+        obs = env.step(ReviewAction(
+            action_type="flag_issue", line_number=8, filename="app.py",
+            issue_type="security", severity="high", description="hardcoded secret"
+        ))
+        # First security TP → should have diversity bonus
+        assert obs.reward_breakdown.get("diversity_bonus", 0) > 0
+
+    def test_second_tp_same_category_no_diversity_bonus(self, env):
+        """Second TP in same category should NOT get diversity bonus."""
+        env.reset(task_id="security-audit")
+        env.step(ReviewAction(
+            action_type="flag_issue", line_number=8, filename="app.py",
+            issue_type="security", severity="high", description="hardcoded secret"
+        ))
+        obs2 = env.step(ReviewAction(
+            action_type="flag_issue", line_number=19, filename="app.py",
+            issue_type="security", severity="critical", description="sql injection"
+        ))
+        assert obs2.reward_breakdown.get("diversity_bonus", 0) == 0
+
+
+# ---------------------------------------------------------------------------
+# Exploration bonus (multi-file tasks)
+# ---------------------------------------------------------------------------
+
+class TestExplorationBonus:
+    def test_multifile_first_flag_gets_exploration_bonus(self, env):
+        """First flag in a new file of a multi-file task gets exploration bonus."""
+        env.reset(task_id="comprehensive-review")
+        obs = env.step(ReviewAction(
+            action_type="flag_issue", line_number=7, filename="models.py",
+            issue_type="security", severity="critical", description="plaintext password"
+        ))
+        assert obs.reward_breakdown.get("exploration_bonus", 0) > 0
+
+    def test_singlefile_no_exploration_bonus(self, env):
+        """Single-file tasks should not give exploration bonus."""
+        env.reset(task_id="bug-detection")
+        obs = env.step(ReviewAction(
+            action_type="flag_issue", line_number=6, filename="utils.py",
+            issue_type="bug", severity="high", description="off by one"
+        ))
+        assert obs.reward_breakdown.get("exploration_bonus", 0) == 0

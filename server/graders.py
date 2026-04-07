@@ -58,21 +58,23 @@ def match_quality(flagged: Issue, gt: Issue) -> str:
     """
     Return quality of match between flagged and gt:
       "exact"  — within ±2 lines and right issue type
-      "near"   — within ±3-5 lines and same file (regardless of type)
+      "near"   — within ±3-5 lines, same file, and compatible issue type
       "none"   — no meaningful match
     """
     if flagged.filename != gt.filename:
         return "none"
 
     line_diff = abs(flagged.line_number - gt.line_number)
+    compat = _TYPE_COMPAT.get(gt.issue_type, {gt.issue_type})
 
     if line_diff <= EXACT_TOLERANCE:
-        compat = _TYPE_COMPAT.get(gt.issue_type, {gt.issue_type})
         if flagged.issue_type in compat:
             return "exact"
 
     if line_diff <= NEAR_TOLERANCE:
-        return "near"
+        # Near-miss requires compatible type to avoid rewarding wrong-type flags
+        if flagged.issue_type in compat:
+            return "near"
 
     return "none"
 

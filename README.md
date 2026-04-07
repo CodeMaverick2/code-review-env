@@ -208,7 +208,9 @@ Near-miss (±3-5 lines): graduated partial credit via exponential decay
 | TP + early (first 40% of steps) | +0.02 bonus |
 | TP + high confidence (≥0.7) | +0.01 bonus |
 | PBRS potential shaping (Φ(s')−Φ(s)) | +0.03–0.08 |
-| Near-miss (±3-5 lines, exponential decay) | +0.020–0.055 |
+| Diversity bonus (first TP in new issue category) | +0.02 |
+| Exploration bonus (first TP in new file, multi-file tasks) | +0.01 |
+| Near-miss (±3-5 lines, compatible type, exp decay) | +0.020–0.055 |
 | False positive | −0.05 |
 | False positive flood (4th+ FP) | escalating −0.03 extra |
 | High-confidence FP | −0.03 extra |
@@ -220,7 +222,9 @@ Near-miss (±3-5 lines): graduated partial credit via exponential decay
 ### Reward shaping foundations
 
 - **Potential-Based Reward Shaping** (Ng et al. 1999): Φ(s) = (tp/total_gt) × 0.5. Policy-invariant shaping that improves sample efficiency without changing the optimal policy.
-- **Graduated near-miss** (exponential decay): reward = 0.10 × e^(−0.6 × (line_diff − 2)) for lines 3-5 off. Gives smooth gradient signal for line-number refinement.
+- **Graduated near-miss** (exponential decay): reward = 0.10 × e^(−0.6 × (line_diff − 2)) for lines 3-5 off with compatible issue type. Gives smooth gradient signal for line-number refinement.
+- **Diversity bonus**: +0.02 for first TP in a new issue category (security/bug/performance). Encourages covering all issue types instead of spamming one.
+- **Exploration bonus**: +0.01 for first TP in a new file (multi-file tasks only). Encourages cross-file coverage.
 - **Variable-Length Return Normalization** (VL Norm 2025): normalized_return = cumulative_reward / steps_used. Makes return comparable across tasks of different lengths.
 - **Flood protection**: escalating FP penalty prevents reward hacking via flag-spamming.
 

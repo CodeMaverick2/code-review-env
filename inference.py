@@ -404,6 +404,12 @@ def run_task(task_id: str, http_client: httpx.Client) -> dict:
         if combined_feedback:
             messages.append({"role": "user", "content": combined_feedback})
 
+        # Context window management: keep system + initial prompt + last 12 exchanges
+        # This prevents token limit errors on long episodes (25+ steps)
+        max_history = 2 + 24  # system + initial user + 12 assistant/user pairs
+        if len(messages) > max_history:
+            messages = messages[:2] + messages[-(max_history - 2):]
+
         atype = action.get("action_type", "")
         print(f"    Step {step_count:2d}: {atype:20s} | reward={str(last_reward):8s} | score={obs.get('current_score', 0.0):.3f}")
 

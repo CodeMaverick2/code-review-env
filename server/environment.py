@@ -44,6 +44,10 @@ _VALIDATION_PENALTY = -0.02
 # Flood protection: escalating FP penalty
 _FP_FLOOD_THRESHOLD = 3             # FPs before escalation kicks in
 _FP_FLOOD_MULTIPLIER = 1.5          # each extra FP beyond threshold costs 1.5x more
+# Diversity bonus: reward for covering a new issue category
+_DIVERSITY_BONUS = 0.02             # first TP in a new issue_type category
+# Exploration bonus: first flag in a previously unflagged file
+_FILE_EXPLORATION_BONUS = 0.01
 
 _SEV_RANK = {"low": 0, "medium": 1, "high": 2, "critical": 3}
 
@@ -80,6 +84,8 @@ class CodeReviewEnvironment(_BaseEnv):
         self._fp_count: int = 0           # total false positives this episode
         self._matched_gt_indices: Set[int] = set()  # GT indices already matched
         self._episode_rewards: List[float] = []  # for VL return normalization
+        self._found_categories: Set[str] = set()  # issue types already found (for diversity bonus)
+        self._flagged_files: Set[str] = set()      # files already flagged (for exploration bonus)
 
     def reset(
         self,
@@ -104,6 +110,8 @@ class CodeReviewEnvironment(_BaseEnv):
         self._fp_count = 0
         self._matched_gt_indices = set()
         self._episode_rewards = []
+        self._found_categories = set()
+        self._flagged_files = set()
 
         self._state = ReviewState(
             task_id=task_id,
@@ -401,6 +409,11 @@ class CodeReviewEnvironment(_BaseEnv):
             fix_suggestion=action.fix_suggestion,
         )
 
+        # Track file exploration
+        is_new_file = action.filename not in self._flagged_files
+        if action.filename:
+            self._flagged_files.add(action.filename)
+
         # Classify: TP, near-miss (with line distance), or FP
         is_tp = False
         is_near = False
@@ -460,16 +473,32 @@ class CodeReviewEnvironment(_BaseEnv):
             pbrs_bonus = round(phi_after - phi_before, 4)
             reward_breakdown["pbrs_shaping"] = pbrs_bonus
 
-            reward = base_reward + severity_bonus + temporal_bonus + confidence_bonus + pbrs_bonus
+            # Diversity bonus: first TP in a new issue category
+            diversity_bonus = 0.0
+            gt_type = matched_gt_issue.issue_type
+            if gt_type not in self._found_categories:
+                self._found_categories.add(gt_type)
+                diversity_bonus = _DIVERSITY_BONUS
+                reward_breakdown["diversity_bonus"] = diversity_bonus
+
+            # Exploration bonus: first flag in a new file (multi-file tasks)
+            exploration_bonus = 0.0
+            if is_new_file and len(self._task.get("code_files", {})) > 1:
+                exploration_bonus = _FILE_EXPLORATION_BONUS
+                reward_breakdown["exploration_bonus"] = exploration_bonus
+
+            reward = (base_reward + severity_bonus + temporal_bonus +
+                      confidence_bonus + pbrs_bonus + diversity_bonus + exploration_bonus)
             reward_breakdown["total"] = round(reward, 4)
 
             sev_note = f", severity +{severity_bonus:.2f}" if severity_bonus else ""
             temp_note = f", early +{temporal_bonus:.2f}" if temporal_bonus else ""
             conf_note = f", conf +{confidence_bonus:.2f}" if confidence_bonus else ""
             pbrs_note = f", progress +{pbrs_bonus:.2f}" if pbrs_bonus > 0 else ""
+            div_note = f", new-type +{diversity_bonus:.2f}" if diversity_bonus else ""
             feedback = (
                 f"Correct! Issue at {action.filename}:{action.line_number} confirmed. "
-                f"[+{reward:.2f}{sev_note}{temp_note}{conf_note}{pbrs_note}]"
+                f"[+{reward:.2f}{sev_note}{temp_note}{conf_note}{pbrs_note}{div_note}]"
             )
 
         elif is_near:

@@ -104,11 +104,18 @@ class TestMatchQuality:
         gt = _issue(6, "utils.py", "bug", "high")
         assert match_quality(f, gt) == "none"
 
-    def test_near_ignores_type_difference(self):
-        """Near match checks same file + line range, ignores type."""
+    def test_near_requires_compatible_type(self):
+        """Near match requires compatible issue type (not just proximity)."""
         f = _issue(10, "utils.py", "performance", "high")
         gt = _issue(6, "utils.py", "bug", "high")
-        # 4 lines away → near
+        # 4 lines away but wrong type → none
+        assert match_quality(f, gt) == "none"
+
+    def test_near_with_compatible_type(self):
+        """Near match works with compatible type (bug/logic)."""
+        f = _issue(10, "utils.py", "logic", "high")
+        gt = _issue(6, "utils.py", "bug", "high")
+        # 4 lines away, compatible type → near
         assert match_quality(f, gt) == "near"
 
     def test_near_tolerance_constant(self):
