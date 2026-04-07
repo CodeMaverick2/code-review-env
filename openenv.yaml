@@ -1,12 +1,13 @@
 spec_version: 1
 name: code_review_env
-version: "2.0.0"
+version: "2.1.0"
 description: >
   A code review and security audit RL environment for training AI agents.
   The agent identifies bugs, security vulnerabilities, and performance issues
   across 7 tasks of increasing difficulty (easy → medium → medium-hard → hard).
   Features: PBRS reward shaping, graduated near-miss rewards, flood protection,
-  CAMRL curriculum selector, VL return normalization, and cross-language tasks.
+  CAMRL curriculum with task replay, VL return normalization, GRPO batch endpoint,
+  diversity/exploration bonuses, and cross-language tasks (Python + JavaScript).
 type: space
 runtime: fastapi
 app: server.app:app
@@ -53,6 +54,13 @@ tasks:
 reward_design:
   terminal: "0.70 * F1 + 0.30 * severity_accuracy"
   shaping: "PBRS (Ng et al. 1999): phi(s) = (tp/total_gt) * 0.5"
-  near_miss: "exponential decay: 0.10 * exp(-0.6 * (line_diff - 2))"
+  near_miss: "exponential decay: 0.10 * exp(-0.6 * (line_diff - 2)), requires compatible type"
+  diversity_bonus: "+0.02 for first TP in a new issue category"
+  exploration_bonus: "+0.01 for first TP in a new file (multi-file tasks)"
   flood_protection: "escalating FP penalty after 3rd false positive"
   normalization: "VL Norm (2025): normalized_return = cumulative / steps_used"
+
+training:
+  grpo_endpoint: "/grpo_batch — group-relative advantages A_i = (r_i - mean) / std"
+  curriculum: "CAMRL with 20% task replay to prevent forgetting"
+  rollout: "/trl_rollout — TRL GRPOTrainer compatible batch rollout"

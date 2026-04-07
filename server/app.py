@@ -303,6 +303,7 @@ class CurriculumRequest(BaseModel):
     agent_performance: Optional[Dict[str, Any]] = None
     easy_threshold: float = 0.30
     hard_threshold: float = 0.70
+    replay_fraction: float = 0.20  # fraction of time to replay earlier tasks (prevents forgetting)
 
 
 @app.post("/curriculum")
@@ -341,7 +342,14 @@ async def curriculum_task_selector(request: CurriculumRequest):
     else:
         avg_success = 0.0
 
-    if avg_success < easy_thresh:
+    # Task replay (prevents catastrophic forgetting, arxiv 2506.06632):
+    # With replay_fraction probability, pick an easy/mastered task instead
+    replay_frac = request.replay_fraction
+    if perf and random.random() < replay_frac:
+        # Replay: pick easiest task (lowest GT count) to maintain baseline skills
+        phase = "replay"
+        recommended = min(ALL_TASKS.keys(), key=lambda t: len(ALL_TASKS[t]["ground_truth_issues"]))
+    elif avg_success < easy_thresh:
         phase = "easy"
         # Focus on task with lowest ground truth issue count (most approachable)
         recommended = min(ALL_TASKS.keys(), key=lambda t: len(ALL_TASKS[t]["ground_truth_issues"]))
@@ -352,7 +360,6 @@ async def curriculum_task_selector(request: CurriculumRequest):
     else:
         phase = "medium"
         # Mix: pick a task proportional to difficulty (harder = more likely)
-        import random
         weights = list(task_difficulty.values())
         total_w = sum(weights) or 1.0
         probs = [w / total_w for w in weights]
@@ -470,6 +477,86 @@ async def trl_rollout(request: TRLRolloutRequest):
         "num_steps": n_steps,
         "state_features": final_progress.get("state_features", []),
         "final_progress": {k: v for k, v in final_progress.items() if k != "state_features"},
+    }
+
+
+class GRPOBatchRequest(BaseModel):
+    task_id: Optional[str] = None
+    seed: Optional[int] = None
+    group: List[List[Dict[str, Any]]]  # G action sequences for group-relative comparison
+
+
+@app.post("/grpo_batch")
+async def grpo_batch(request: GRPOBatchRequest):
+    """
+    GRPO group-relative rollout batch (DeepSeek-R1 / DeepSeekMath style).
+
+    Runs G action sequences on the SAME task, computes group-relative advantages:
+      A_i = (r_i - mean(r_1..r_G)) / std(r_1..r_G)
+
+    This replaces the PPO critic entirely — no value network needed.
+    Recommended group size G=64 (DeepSeekMath), G=8-16 for faster iteration.
+
+    Body:
+      task_id: str (optional)
+      seed: int (optional, ensures same task state for all rollouts)
+      group: [[actions_1], [actions_2], ..., [actions_G]]
+
+    Returns:
+      rollouts: [{episode_return, final_score, advantage, ...}]
+      group_stats: {mean, std, G}
+    """
+    G = len(request.group)
+    if G < 2:
+        raise HTTPException(400, "GRPO requires at least 2 rollouts in the group")
+
+    returns = []
+    rollout_results = []
+
+    for action_seq in request.group:
+        rollout_env = CodeReviewEnvironment()
+        rollout_env.reset(task_id=request.task_id, seed=request.seed)
+
+        episode_return = 0.0
+        final_score = 0.0
+        n_steps = 0
+
+        for action_dict in action_seq:
+            action = ReviewAction.from_dict(action_dict)
+            obs_step = rollout_env.step(action)
+            step_data = _serialize(obs_step)
+            reward = step_data.get("reward") or 0.0
+            episode_return += reward
+            n_steps += 1
+
+            if step_data.get("done", False):
+                final_score = step_data.get("reward", step_data.get("current_score", 0.0)) or 0.0
+                break
+
+        returns.append(final_score)
+        rollout_results.append({
+            "episode_return": round(episode_return, 4),
+            "final_score": round(final_score, 4),
+            "num_steps": n_steps,
+        })
+
+    # Compute group-relative advantages: A_i = (r_i - mean) / std
+    mean_r = sum(returns) / G
+    variance = sum((r - mean_r) ** 2 for r in returns) / G
+    std_r = max(variance ** 0.5, 1e-8)
+
+    for i, result in enumerate(rollout_results):
+        result["advantage"] = round((returns[i] - mean_r) / std_r, 4)
+
+    return {
+        "task_id": request.task_id,
+        "rollouts": rollout_results,
+        "group_stats": {
+            "mean": round(mean_r, 4),
+            "std": round(std_r, 4),
+            "G": G,
+        },
+        "method": "GRPO",
     }
 
 
