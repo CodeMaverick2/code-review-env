@@ -76,6 +76,10 @@ def _make_app() -> FastAPI:
         allow_headers=["*"],
     )
 
+    @_app.get("/")
+    async def root():
+        return {"name": "code-review-env", "status": "healthy", "tasks": len(ALL_TASKS), "docs": "/docs"}
+
     @_app.get("/health")
     async def health():
         return {"status": "healthy"}
