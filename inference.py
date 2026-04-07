@@ -1,16 +1,14 @@
 """
 Inference script for the Code Review Environment.
 
-Environment variables:
-    API_BASE_URL  — LLM API endpoint (e.g. https://openrouter.ai/api/v1)
-    MODEL_NAME    — Model identifier (e.g. openai/gpt-4o-mini)
-    HF_TOKEN      — API key for the LLM provider (also accepts OPENAI_API_KEY)
-    ENV_URL       — Environment base URL (default: localhost:7860)
+Environment variables (MANDATORY):
+    API_BASE_URL  — LLM API endpoint (default: https://router.huggingface.co/v1)
+    MODEL_NAME    — Model identifier (default: Qwen/Qwen2.5-72B-Instruct)
+    HF_TOKEN      — Your HuggingFace / API key (no default — must be set)
+    ENV_URL       — Environment base URL (default: http://localhost:7860)
 
 Usage:
-    export API_BASE_URL=https://openrouter.ai/api/v1
-    export MODEL_NAME=openai/gpt-4o-mini
-    export HF_TOKEN=sk-...
+    export HF_TOKEN=hf_...
     python inference.py
 """
 from __future__ import annotations
@@ -23,10 +21,33 @@ from typing import Optional
 
 import httpx
 
-API_BASE_URL: str = os.environ.get("API_BASE_URL", "").rstrip("/")
-MODEL_NAME: str = os.environ.get("MODEL_NAME", "gpt-4o-mini")
-HF_TOKEN: str = os.environ.get("HF_TOKEN") or os.environ.get("OPENAI_API_KEY", "")
-ENV_URL: str = os.environ.get("ENV_URL", "http://localhost:7860").rstrip("/")
+API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
+MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
+HF_TOKEN = os.getenv("HF_TOKEN")
+ENV_URL: str = os.getenv("ENV_URL", "http://localhost:7860").rstrip("/")
+BENCHMARK = "code-review-env"
+
+
+# ---------------------------------------------------------------------------
+# Structured stdout logging — MANDATORY format for OpenEnv submission
+# ---------------------------------------------------------------------------
+
+def log_start(task: str, env: str, model: str) -> None:
+    print(f"[START] task={task} env={env} model={model}", flush=True)
+
+
+def log_step(step: int, action: str, reward: float, done: bool, error: Optional[str]) -> None:
+    error_val = error if error else "null"
+    done_val = str(done).lower()
+    print(
+        f"[STEP] step={step} action={action} reward={reward:.2f} done={done_val} error={error_val}",
+        flush=True,
+    )
+
+
+def log_end(success: bool, steps: int, score: float, rewards: list) -> None:
+    rewards_str = ",".join(f"{r:.2f}" for r in rewards)
+    print(f"[END] success={str(success).lower()} steps={steps} score={score:.2f} rewards={rewards_str}", flush=True)
 
 # Curriculum ordering: easy → medium → medium-hard → hard
 # Research (CAMRL, Curriculum RL): start with simpler tasks to build
@@ -102,16 +123,9 @@ When finished, respond with:
 
 
 def chat_completion(messages: list) -> str:
-    try:
-        from openai import OpenAI
-    except ImportError:
-        raise ImportError("pip install openai")
+    from openai import OpenAI
 
-    kwargs = {"api_key": HF_TOKEN or "no-key"}
-    if API_BASE_URL:
-        kwargs["base_url"] = API_BASE_URL
-
-    client = OpenAI(**kwargs)
+    client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
     try:
         response = client.chat.completions.create(
             model=MODEL_NAME,
@@ -121,7 +135,7 @@ def chat_completion(messages: list) -> str:
         )
         return response.choices[0].message.content.strip()
     except Exception as e:
-        print(f"    LLM call failed: {e}")
+        print(f"[DEBUG] LLM call failed: {e}", flush=True)
         raise
 
 
@@ -165,7 +179,7 @@ def run_keyword_fallback(base_url: str, task_id: str) -> dict:
             score = results["baseline_scores"].get(task_id, {}).get("score", 0.0)
             return {"task_id": task_id, "score": score, "steps": 0, "method": "keyword_heuristic"}
     except Exception as e:
-        print(f"    Keyword fallback failed: {e}")
+        print(f"[DEBUG] Keyword fallback failed: {e}", flush=True)
         return {"task_id": task_id, "score": 0.0, "steps": 0, "method": "error"}
 
 
@@ -274,12 +288,18 @@ def _should_clear_flag(obs: dict, last_reward: float, last_action: dict) -> Opti
 
 
 def run_task(task_id: str, http_client: httpx.Client) -> dict:
+    log_start(task=task_id, env=BENCHMARK, model=MODEL_NAME)
+    all_rewards: list = []
+    step_count = 0
+    final_score = 0.0
+
     try:
         resp = http_client.post(f"{ENV_URL}/reset", json={"task_id": task_id}, timeout=30)
         resp.raise_for_status()
         obs = resp.json()
     except Exception as e:
-        print(f"    Reset failed: {e} — falling back to keyword heuristic")
+        print(f"[DEBUG] Reset failed: {e}", flush=True)
+        log_end(success=False, steps=0, score=0.0, rewards=[])
         return run_keyword_fallback(ENV_URL, task_id)
 
     code_display = "\n\n".join(
@@ -336,8 +356,6 @@ def run_task(task_id: str, http_client: httpx.Client) -> dict:
     ]
 
     done = False
-    step_count = 0
-    final_score = 0.0
     last_action: dict = {}
     last_reward: Optional[float] = None
     consecutive_fp = 0
@@ -354,12 +372,13 @@ def run_task(task_id: str, http_client: httpx.Client) -> dict:
             try:
                 action_text = chat_completion(messages)
             except Exception as e:
-                print(f"    LLM unavailable ({e}) — submitting and falling back to keyword heuristic")
+                print(f"[DEBUG] LLM unavailable ({e}) — submitting", flush=True)
                 try:
                     http_client.post(f"{ENV_URL}/step", json={"action_type": "submit_review"}, timeout=30)
                 except Exception:
                     pass
-                return run_keyword_fallback(ENV_URL, task_id)
+                log_end(success=False, steps=step_count, score=0.0, rewards=all_rewards)
+                return {"task_id": task_id, "score": 0.0, "steps": step_count, "method": "error"}
 
             action = parse_action(action_text)
 
@@ -374,7 +393,8 @@ def run_task(task_id: str, http_client: httpx.Client) -> dict:
             step_resp.raise_for_status()
             obs = step_resp.json()
         except Exception as e:
-            print(f"    Step error: {e}")
+            step_count += 1
+            log_step(step=step_count, action="error", reward=0.0, done=True, error=str(e))
             break
 
         done = obs.get("done", False)
@@ -411,7 +431,16 @@ def run_task(task_id: str, http_client: httpx.Client) -> dict:
             messages = messages[:2] + messages[-(max_history - 2):]
 
         atype = action.get("action_type", "")
-        print(f"    Step {step_count:2d}: {atype:20s} | reward={str(last_reward):8s} | score={obs.get('current_score', 0.0):.3f}")
+        reward_val = float(last_reward) if last_reward is not None else 0.0
+        all_rewards.append(reward_val)
+        action_str = f"{atype}({action.get('filename', '')}:{action.get('line_number', '')})" if atype == "flag_issue" else atype
+        log_step(
+            step=step_count,
+            action=action_str,
+            reward=reward_val,
+            done=done,
+            error=None,
+        )
 
         if atype == "submit_review":
             final_score = obs.get("reward", obs.get("current_score", 0.0)) or 0.0
@@ -419,6 +448,12 @@ def run_task(task_id: str, http_client: httpx.Client) -> dict:
 
         time.sleep(0.3)
 
+    log_end(
+        success=final_score >= 0.5,
+        steps=step_count,
+        score=final_score,
+        rewards=all_rewards,
+    )
     return {
         "task_id": task_id,
         "score": float(final_score),
@@ -450,27 +485,24 @@ def main():
     if use_llm:
         with httpx.Client(timeout=60) as client:
             for task_id in TASK_IDS:
-                print(f"Running task: {task_id}")
                 result = run_task(task_id, client)
                 results[task_id] = result
-                print(f"  → score: {result['score']:.4f}  ({result['steps']} steps, method={result['method']})\n")
     else:
-        print("HF_TOKEN / API_BASE_URL not set — using built-in keyword heuristic baseline.\n")
         for task_id in TASK_IDS:
-            print(f"Running task: {task_id}")
+            log_start(task=task_id, env=BENCHMARK, model=MODEL_NAME)
             result = run_keyword_fallback(ENV_URL, task_id)
             results[task_id] = result
-            print(f"  → score: {result['score']:.4f}\n")
-
-    print("=" * 50)
-    print("INFERENCE RESULTS")
-    print("=" * 50)
-    for task_id, r in results.items():
-        print(f"  {task_id:30s}  score={r['score']:.4f}")
+            log_end(
+                success=result["score"] >= 0.5,
+                steps=0,
+                score=result["score"],
+                rewards=[],
+            )
 
     overall = sum(r["score"] for r in results.values()) / len(results)
-    print(f"\n  Overall average: {overall:.4f}")
-    print("=" * 50)
+    for task_id, r in results.items():
+        print(f"[DEBUG] {task_id:30s}  score={r['score']:.4f}", flush=True)
+    print(f"[DEBUG] Overall average: {overall:.4f}", flush=True)
 
     return results
 
