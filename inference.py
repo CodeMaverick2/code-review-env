@@ -1,11 +1,14 @@
 """
-Inference script for the Code Review Environment.
+Inference Script — Code Review Environment
+===========================================
+MANDATORY environment variables:
+    API_BASE_URL   The API endpoint for the LLM.
+    MODEL_NAME     The model identifier to use for inference.
+    HF_TOKEN       Your Hugging Face / API key.
 
-Environment variables (MANDATORY):
-    API_BASE_URL  — LLM API endpoint (default: https://router.huggingface.co/v1)
-    MODEL_NAME    — Model identifier (default: Qwen/Qwen2.5-72B-Instruct)
-    HF_TOKEN      — Your HuggingFace / API key (no default — must be set)
-    ENV_URL       — Environment base URL (default: http://localhost:7860)
+Defaults are set only for API_BASE_URL and MODEL_NAME:
+    API_BASE_URL = os.getenv("API_BASE_URL") or "https://router.huggingface.co/v1"
+    MODEL_NAME   = os.getenv("MODEL_NAME") or "Qwen/Qwen2.5-72B-Instruct"
 
 Usage:
     export HF_TOKEN=hf_...
@@ -17,13 +20,14 @@ import os
 import sys
 import json
 import time
-from typing import Optional
+from typing import List, Optional
 
 import httpx
+from openai import OpenAI
 
-API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
-MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
-HF_TOKEN = os.getenv("HF_TOKEN")
+API_KEY = os.getenv("HF_TOKEN") or os.getenv("API_KEY")
+API_BASE_URL = os.getenv("API_BASE_URL") or "https://router.huggingface.co/v1"
+MODEL_NAME = os.getenv("MODEL_NAME") or "Qwen/Qwen2.5-72B-Instruct"
 ENV_URL: str = os.getenv("ENV_URL", "http://localhost:7860").rstrip("/")
 BENCHMARK = "code-review-env"
 
@@ -45,9 +49,9 @@ def log_step(step: int, action: str, reward: float, done: bool, error: Optional[
     )
 
 
-def log_end(success: bool, steps: int, score: float, rewards: list) -> None:
+def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> None:
     rewards_str = ",".join(f"{r:.2f}" for r in rewards)
-    print(f"[END] success={str(success).lower()} steps={steps} score={score:.2f} rewards={rewards_str}", flush=True)
+    print(f"[END] success={str(success).lower()} steps={steps} score={score:.3f} rewards={rewards_str}", flush=True)
 
 # Curriculum ordering: easy → medium → medium-hard → hard
 # Research (CAMRL, Curriculum RL): start with simpler tasks to build
@@ -115,17 +119,16 @@ When finished, respond with:
 ## RULES
 - Raw JSON only — no markdown fences, no extra text
 - One action per response
-- Count lines carefully from line 1 (including blank lines and comments)
+- Line numbers are shown as "N|" prefix — use those EXACT numbers, do NOT count yourself
 - Only flag REAL issues — no style preferences, no hypothetical issues
 - Be precise: "SQL injection at line 19 via f-string in SELECT query" not just "SQL injection"
 - Flag the EXACT line where the problem code is (the f-string line, not the function def)
+- issue_type MUST be: "security" for injection/XSS/hardcoded secrets/crypto/auth, "bug" for logic/off-by-one/wrong values, "performance" for N+1/missing gather/uncapped pagination
 """
 
 
 def chat_completion(messages: list) -> str:
-    from openai import OpenAI
-
-    client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
+    client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
     try:
         response = client.chat.completions.create(
             model=MODEL_NAME,
@@ -258,26 +261,30 @@ def _should_submit(obs: dict, step_count: int, max_steps: int) -> bool:
     return False
 
 
+_cleared_lines: set = set()  # track lines we've already cleared to prevent loops
+
+
 def _should_clear_flag(obs: dict, last_reward: float, last_action: dict) -> Optional[dict]:
     """
     Recovery strategy: if the last flag was a false positive with high penalty,
-    suggest clearing it to recover partial reward and improve precision.
-
-    Returns a clear_flag action dict if we should recover, else None.
+    suggest clearing it. Only clears each line ONCE to prevent flag/clear loops.
     """
     if last_reward is None or last_reward >= 0:
         return None
     if last_action.get("action_type") != "flag_issue":
         return None
 
-    # Only clear if it was a clear FP (no near-miss indicator in feedback)
-    # and we've got too many false positives
+    # Prevent loop: never clear the same line twice
+    line_key = (last_action.get("filename"), last_action.get("line_number"))
+    if line_key in _cleared_lines:
+        return None
+
     progress = obs.get("progress", {})
     fp = int(progress.get("false_positives", 0))
     tp = int(progress.get("true_positives", 0))
 
-    # If FP > TP and last reward was notably negative, clear the bad flag
     if fp > tp and last_reward <= -0.05:
+        _cleared_lines.add(line_key)
         return {
             "action_type": "clear_flag",
             "line_number": last_action.get("line_number"),
@@ -289,7 +296,8 @@ def _should_clear_flag(obs: dict, last_reward: float, last_action: dict) -> Opti
 
 def run_task(task_id: str, http_client: httpx.Client) -> dict:
     log_start(task=task_id, env=BENCHMARK, model=MODEL_NAME)
-    all_rewards: list = []
+    _cleared_lines.clear()  # reset per-task
+    all_rewards: List[float] = []
     step_count = 0
     final_score = 0.0
 
@@ -297,163 +305,141 @@ def run_task(task_id: str, http_client: httpx.Client) -> dict:
         resp = http_client.post(f"{ENV_URL}/reset", json={"task_id": task_id}, timeout=30)
         resp.raise_for_status()
         obs = resp.json()
-    except Exception as e:
-        print(f"[DEBUG] Reset failed: {e}", flush=True)
-        log_end(success=False, steps=0, score=0.0, rewards=[])
-        return run_keyword_fallback(ENV_URL, task_id)
 
-    code_display = "\n\n".join(
-        f"=== {fname} (starting at line 1) ===\n{code}"
-        for fname, code in obs.get("code_files", {}).items()
-    )
+        # Show code WITH line numbers — critical for LLM line-counting accuracy
+        code_parts = []
+        for fname, code in obs.get("code_files", {}).items():
+            numbered_lines = "\n".join(
+                f"{i+1:3d}| {line}" for i, line in enumerate(code.splitlines())
+            )
+            code_parts.append(f"=== {fname} ===\n{numbered_lines}")
+        code_display = "\n\n".join(code_parts)
 
-    # Include function map hint if available
-    code_metadata = obs.get("code_metadata") or {}
-    function_ranges = code_metadata.get("function_ranges", [])
-    fn_map_hint = ""
-    if function_ranges:
-        fn_lines = [f"  {fr['name']}() in {fr['file']} (lines {fr['start']}-{fr['end']})"
-                    for fr in function_ranges]
-        fn_map_hint = "\n\nFunction map:\n" + "\n".join(fn_lines)
+        code_metadata = obs.get("code_metadata") or {}
+        function_ranges = code_metadata.get("function_ranges", [])
+        fn_map_hint = ""
+        if function_ranges:
+            fn_lines = [f"  {fr['name']}() in {fr['file']} (lines {fr['start']}-{fr['end']})"
+                        for fr in function_ranges]
+            fn_map_hint = "\n\nFunction map:\n" + "\n".join(fn_lines)
 
-    task_desc = obs.get("task_description", "")
-    max_steps = obs.get("max_steps", 20)
-    issue_categories = code_metadata.get("issue_categories", [])
-    n_gt = len(obs.get("code_files", {}))  # rough complexity hint
-    category_hint = ""
-    if issue_categories:
-        category_hint = f"\nIssue categories to look for: {sorted(set(issue_categories))}"
+        task_desc = obs.get("task_description", "")
+        max_steps = obs.get("max_steps", 20)
+        issue_categories = code_metadata.get("issue_categories", [])
+        category_hint = ""
+        if issue_categories:
+            category_hint = f"\nIssue categories to look for: {sorted(set(issue_categories))}"
 
-    # RC-GRPO style reward conditioning (2025): tell the agent what quality level
-    # it should aim for, so it calibrates confidence appropriately.
-    state_features = code_metadata.get("state_features", [])
-    complexity_label = "medium"
-    if state_features and len(state_features) >= 4:
-        complexity_score = state_features[3]
-        complexity_label = "high" if complexity_score >= 1.0 else "medium" if complexity_score >= 0.5 else "low"
+        state_features = code_metadata.get("state_features", [])
+        complexity_label = "medium"
+        if state_features and len(state_features) >= 4:
+            complexity_score = state_features[3]
+            complexity_label = "high" if complexity_score >= 1.0 else "medium" if complexity_score >= 0.5 else "low"
 
-    reward_conditioning = (
-        f"[TARGET: high-quality review, score ≥ 0.85. "
-        f"Code complexity: {complexity_label}. "
-        f"Be thorough — missing issues costs more than a single FP.]"
-    )
-
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {
-            "role": "user",
-            "content": (
-                f"{reward_conditioning}\n\n"
-                f"Task: {task_desc}\n\n"
-                f"{code_display}"
-                f"{fn_map_hint}"
-                f"{category_hint}\n\n"
-                f"You have {max_steps} steps total. "
-                f"Work through the checklist systematically, function by function. "
-                f"Flag each issue one at a time as a raw JSON object."
-            ),
-        },
-    ]
-
-    done = False
-    last_action: dict = {}
-    last_reward: Optional[float] = None
-    consecutive_fp = 0
-
-    while not done and step_count < max_steps:
-        # --- Auto clear_flag recovery: undo recent FP if hurting precision ---
-        recovery_action = _should_clear_flag(obs, last_reward, last_action)
-        if recovery_action and step_count < max_steps - 1:
-            action = recovery_action
-            action_text = json.dumps(action)
-            print(f"    Auto-recovery: clearing FP at {action.get('filename')}:{action.get('line_number')}")
-        else:
-            # --- Normal LLM action ---
-            try:
-                action_text = chat_completion(messages)
-            except Exception as e:
-                print(f"[DEBUG] LLM unavailable ({e}) — submitting", flush=True)
-                try:
-                    http_client.post(f"{ENV_URL}/step", json={"action_type": "submit_review"}, timeout=30)
-                except Exception:
-                    pass
-                log_end(success=False, steps=step_count, score=0.0, rewards=all_rewards)
-                return {"task_id": task_id, "score": 0.0, "steps": step_count, "method": "error"}
-
-            action = parse_action(action_text)
-
-            # Smart submission: inject submit if progress shows we're done
-            if action.get("action_type") != "submit_review" and _should_submit(obs, step_count, max_steps):
-                print(f"    Smart submit at step {step_count + 1} (recall target met)")
-                action = {"action_type": "submit_review"}
-                action_text = json.dumps(action)
-
-        try:
-            step_resp = http_client.post(f"{ENV_URL}/step", json=action, timeout=30)
-            step_resp.raise_for_status()
-            obs = step_resp.json()
-        except Exception as e:
-            step_count += 1
-            log_step(step=step_count, action="error", reward=0.0, done=True, error=str(e))
-            break
-
-        done = obs.get("done", False)
-        step_count += 1
-        last_reward = obs.get("reward")
-        # Use terminal reward (final grade) when done, else intermediate score
-        if done:
-            final_score = last_reward or obs.get("current_score", 0.0)
-        else:
-            final_score = obs.get("current_score", 0.0)
-        last_action = action
-
-        # Track consecutive FPs for logging
-        if last_reward is not None and last_reward < 0 and action.get("action_type") == "flag_issue":
-            consecutive_fp += 1
-        else:
-            consecutive_fp = 0
-
-        # Build rich feedback for next LLM turn
-        progress_feedback = _build_progress_feedback(obs)
-        env_feedback = obs.get("feedback", "")
-        combined_feedback = env_feedback
-        if progress_feedback:
-            combined_feedback += f"\n{progress_feedback}"
-
-        messages.append({"role": "assistant", "content": action_text})
-        if combined_feedback:
-            messages.append({"role": "user", "content": combined_feedback})
-
-        # Context window management: keep system + initial prompt + last 12 exchanges
-        # This prevents token limit errors on long episodes (25+ steps)
-        max_history = 2 + 24  # system + initial user + 12 assistant/user pairs
-        if len(messages) > max_history:
-            messages = messages[:2] + messages[-(max_history - 2):]
-
-        atype = action.get("action_type", "")
-        reward_val = float(last_reward) if last_reward is not None else 0.0
-        all_rewards.append(reward_val)
-        action_str = f"{atype}({action.get('filename', '')}:{action.get('line_number', '')})" if atype == "flag_issue" else atype
-        log_step(
-            step=step_count,
-            action=action_str,
-            reward=reward_val,
-            done=done,
-            error=None,
+        reward_conditioning = (
+            f"[TARGET: high-quality review, score ≥ 0.85. "
+            f"Code complexity: {complexity_label}. "
+            f"Be thorough — missing issues costs more than a single FP.]"
         )
 
-        if atype == "submit_review":
-            final_score = obs.get("reward", obs.get("current_score", 0.0)) or 0.0
-            break
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": (
+                    f"{reward_conditioning}\n\n"
+                    f"Task: {task_desc}\n\n"
+                    f"{code_display}"
+                    f"{fn_map_hint}"
+                    f"{category_hint}\n\n"
+                    f"You have {max_steps} steps total. "
+                    f"Work through the checklist systematically, function by function. "
+                    f"Flag each issue one at a time as a raw JSON object."
+                ),
+            },
+        ]
 
-        time.sleep(0.3)
+        done = False
+        last_action: dict = {}
+        last_reward: Optional[float] = None
 
-    log_end(
-        success=final_score >= 0.5,
-        steps=step_count,
-        score=final_score,
-        rewards=all_rewards,
-    )
+        while not done and step_count < max_steps:
+            recovery_action = _should_clear_flag(obs, last_reward, last_action)
+            if recovery_action and step_count < max_steps - 1:
+                action = recovery_action
+                action_text = json.dumps(action)
+            else:
+                try:
+                    action_text = chat_completion(messages)
+                except Exception as e:
+                    print(f"[DEBUG] LLM unavailable ({e})", flush=True)
+                    try:
+                        http_client.post(f"{ENV_URL}/step", json={"action_type": "submit_review"}, timeout=30)
+                    except Exception:
+                        pass
+                    break
+
+                action = parse_action(action_text)
+
+                if action.get("action_type") != "submit_review" and _should_submit(obs, step_count, max_steps):
+                    action = {"action_type": "submit_review"}
+                    action_text = json.dumps(action)
+
+            try:
+                step_resp = http_client.post(f"{ENV_URL}/step", json=action, timeout=30)
+                step_resp.raise_for_status()
+                obs = step_resp.json()
+            except Exception as e:
+                step_count += 1
+                log_step(step=step_count, action="error", reward=0.0, done=True, error=str(e))
+                break
+
+            done = obs.get("done", False)
+            step_count += 1
+            last_reward = obs.get("reward")
+            if done:
+                final_score = last_reward or obs.get("current_score", 0.0)
+            else:
+                final_score = obs.get("current_score", 0.0)
+            last_action = action
+
+            # Build feedback for next LLM turn
+            progress_feedback = _build_progress_feedback(obs)
+            env_feedback = obs.get("feedback", "")
+            combined_feedback = env_feedback
+            if progress_feedback:
+                combined_feedback += f"\n{progress_feedback}"
+
+            messages.append({"role": "assistant", "content": action_text})
+            if combined_feedback:
+                messages.append({"role": "user", "content": combined_feedback})
+
+            max_history = 2 + 24
+            if len(messages) > max_history:
+                messages = messages[:2] + messages[-(max_history - 2):]
+
+            atype = action.get("action_type", "")
+            reward_val = float(last_reward) if last_reward is not None else 0.0
+            all_rewards.append(reward_val)
+            action_str = f"{atype}({action.get('filename', '')}:{action.get('line_number', '')})" if atype == "flag_issue" else atype
+            log_step(step=step_count, action=action_str, reward=reward_val, done=done, error=None)
+
+            if atype == "submit_review":
+                final_score = obs.get("reward", obs.get("current_score", 0.0)) or 0.0
+                break
+
+            time.sleep(0.3)
+
+    except Exception as e:
+        print(f"[DEBUG] Task {task_id} error: {e}", flush=True)
+    finally:
+        log_end(
+            success=final_score >= 0.5,
+            steps=step_count,
+            score=final_score,
+            rewards=all_rewards,
+        )
+
     return {
         "task_id": task_id,
         "score": float(final_score),
@@ -463,21 +449,14 @@ def run_task(task_id: str, http_client: httpx.Client) -> dict:
 
 
 def main():
-    use_llm = bool(HF_TOKEN and API_BASE_URL)
-
-    print("Code Review Environment — Inference")
-    print(f"  Model   : {MODEL_NAME}")
-    print(f"  API URL : {API_BASE_URL or '(not set — using keyword heuristic)'}")
-    print(f"  Env URL : {ENV_URL}")
-    print(f"  Tasks   : {TASK_IDS}\n")
+    use_llm = bool(API_KEY and API_BASE_URL)
 
     try:
         with httpx.Client(timeout=10) as probe:
             health = probe.get(f"{ENV_URL}/health")
             health.raise_for_status()
-            print(f"  Health: {health.json()}\n")
     except Exception as e:
-        print(f"ERROR: Cannot reach environment at {ENV_URL}: {e}")
+        print(f"[DEBUG] Cannot reach environment at {ENV_URL}: {e}", flush=True)
         sys.exit(1)
 
     results = {}
