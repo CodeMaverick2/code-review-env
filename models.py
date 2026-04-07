@@ -80,6 +80,8 @@ class ReviewAction(_BaseAction):
     severity: Optional[str] = None
     description: str = ""
     fix_suggestion: Optional[str] = None
+    confidence: Optional[float] = None       # agent's confidence 0.0–1.0
+    related_lines: Optional[List[int]] = None  # multi-line issues
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
@@ -91,6 +93,8 @@ class ReviewAction(_BaseAction):
             "severity": self.severity,
             "description": self.description,
             "fix_suggestion": self.fix_suggestion,
+            "confidence": self.confidence,
+            "related_lines": self.related_lines,
         }
 
     @classmethod
@@ -103,6 +107,8 @@ class ReviewAction(_BaseAction):
             severity=d.get("severity"),
             description=str(d.get("description", "")),
             fix_suggestion=d.get("fix_suggestion"),
+            confidence=d.get("confidence"),
+            related_lines=d.get("related_lines"),
         )
 
 
@@ -125,6 +131,11 @@ class ReviewObservation(_BaseObservation):
     done: bool = False
     reward: Optional[float] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
+    # New fields
+    reward_breakdown: Dict[str, float] = field(default_factory=dict)
+    progress: Dict[str, float] = field(default_factory=dict)
+    flagged_summary: Dict[str, Any] = field(default_factory=dict)
+    code_metadata: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -141,6 +152,10 @@ class ReviewObservation(_BaseObservation):
             "done": self.done,
             "reward": self.reward,
             "metadata": self.metadata,
+            "reward_breakdown": self.reward_breakdown,
+            "progress": self.progress,
+            "flagged_summary": self.flagged_summary,
+            "code_metadata": self.code_metadata,
         }
 
     @classmethod
@@ -158,6 +173,11 @@ class ReviewObservation(_BaseObservation):
             current_score=d.get("current_score", 0.0),
             done=d.get("done", False),
             reward=d.get("reward"),
+            metadata=d.get("metadata", {}),
+            reward_breakdown=d.get("reward_breakdown", {}),
+            progress=d.get("progress", {}),
+            flagged_summary=d.get("flagged_summary", {}),
+            code_metadata=d.get("code_metadata", {}),
         )
 
 

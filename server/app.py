@@ -21,6 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import json
 import asyncio
 import dataclasses
+import random
 from typing import Optional, List, Dict, Any
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
@@ -29,7 +30,10 @@ from pydantic import BaseModel
 
 from models import ReviewAction, Issue
 from server.environment import CodeReviewEnvironment
-from server.graders import grade_episode, run_keyword_baseline
+from server.graders import (
+    grade_episode, grade_episode_detailed, run_keyword_baseline,
+    compute_code_state_features, RewardNormalizer,
+)
 from tasks.data import ALL_TASKS, TASK_IDS
 
 
@@ -45,6 +49,7 @@ def _serialize(obj) -> dict:
 
 
 _env_instance = CodeReviewEnvironment()
+_reward_normalizer = RewardNormalizer(window_size=100)
 
 
 def _make_app() -> FastAPI:
@@ -245,27 +250,25 @@ async def run_grader(request: GraderRequest):
 
     flagged = [Issue.from_dict(i) for i in request.flagged_issues]
     ground_truth = [Issue.from_dict(gt) for gt in task["ground_truth_issues"]]
-    score = grade_episode(flagged, ground_truth)
-
-    tp = sum(
-        1 for f in flagged
-        if any(
-            True for gt in ground_truth
-            if abs(f.line_number - gt.line_number) <= 2
-            and f.filename == gt.filename
-        )
-    )
+    detailed = grade_episode_detailed(flagged, ground_truth)
 
     return {
         "task_id": request.task_id,
         "difficulty": task["difficulty"],
-        "score": score,
+        "score": detailed["score"],
         "max_score": 1.0,
+        "f1": detailed["f1"],
+        "precision": detailed["precision"],
+        "recall": detailed["recall"],
+        "severity_accuracy": detailed["severity_accuracy"],
         "details": {
             "total_flagged": len(flagged),
-            "true_positives": tp,
-            "false_positives": len(flagged) - tp,
+            "true_positives": detailed["true_positives"],
+            "false_positives": detailed["false_positives"],
+            "false_negatives": detailed["false_negatives"],
+            "near_misses": detailed["near_misses"],
             "total_ground_truth": len(ground_truth),
+            "per_file": detailed["per_file"],
         },
     }
 
@@ -293,6 +296,180 @@ async def run_baseline():
             "Run 'python baseline.py' with OPENAI_API_KEY for the LLM-based baseline. "
             "This endpoint uses a deterministic regex heuristic."
         ),
+    }
+
+
+class CurriculumRequest(BaseModel):
+    agent_performance: Optional[Dict[str, Any]] = None
+    easy_threshold: float = 0.30
+    hard_threshold: float = 0.70
+
+
+@app.post("/curriculum")
+async def curriculum_task_selector(request: CurriculumRequest):
+    """
+    CAMRL-style curriculum task selector (Curriculum-based Asymmetric Multi-Task RL, TPAMI 2023).
+
+    Given agent performance metrics per task, returns the recommended next task_id
+    based on curriculum phase:
+      - easy phase  (avg_success < 0.30): focus on task with fewest issues
+      - medium phase (0.30-0.70):         mix easy/hard (70% easy, 30% hard)
+      - hard phase  (avg_success > 0.70): focus on least-solved hard tasks
+
+    Body:
+      agent_performance: {task_id: {success_rate: 0.5, episodes: 10, avg_score: 0.4}}
+      easy_threshold: float (default 0.3)
+      hard_threshold: float (default 0.7)
+    """
+    perf = request.agent_performance or {}
+    easy_thresh = request.easy_threshold
+    hard_thresh = request.hard_threshold
+
+    # Build difficulty estimate per task: (1 - success_rate) × complexity
+    task_difficulty: Dict[str, float] = {}
+    for task_id, task in ALL_TASKS.items():
+        n_issues = len(task["ground_truth_issues"])
+        complexity = min(1.0, n_issues / 10.0)
+        task_perf = perf.get(task_id, {})
+        success_rate = float(task_perf.get("success_rate", task_perf.get("avg_score", 0.0)))
+        task_difficulty[task_id] = round((1.0 - success_rate) * complexity, 4)
+
+    # Determine curriculum phase
+    if perf:
+        all_success = [float(p.get("success_rate", p.get("avg_score", 0.0))) for p in perf.values()]
+        avg_success = sum(all_success) / len(all_success)
+    else:
+        avg_success = 0.0
+
+    if avg_success < easy_thresh:
+        phase = "easy"
+        # Focus on task with lowest ground truth issue count (most approachable)
+        recommended = min(ALL_TASKS.keys(), key=lambda t: len(ALL_TASKS[t]["ground_truth_issues"]))
+    elif avg_success > hard_thresh:
+        phase = "hard"
+        # Focus on hardest unsolved task (highest difficulty score)
+        recommended = max(task_difficulty, key=task_difficulty.get)
+    else:
+        phase = "medium"
+        # Mix: pick a task proportional to difficulty (harder = more likely)
+        import random
+        weights = list(task_difficulty.values())
+        total_w = sum(weights) or 1.0
+        probs = [w / total_w for w in weights]
+        recommended = random.choices(list(task_difficulty.keys()), weights=probs, k=1)[0]
+
+    return {
+        "recommended_task_id": recommended,
+        "curriculum_phase": phase,
+        "avg_success_rate": round(avg_success, 4),
+        "task_difficulty_scores": task_difficulty,
+        "thresholds": {"easy": easy_thresh, "hard": hard_thresh},
+        "method": "CAMRL",
+    }
+
+
+@app.get("/reward_normalizer")
+async def get_reward_normalizer_stats():
+    """
+    Return current RewardNormalizer statistics for the running environment.
+    Useful for monitoring VL Norm across training runs.
+    """
+    return _reward_normalizer.to_dict()
+
+
+@app.post("/record_episode")
+async def record_episode(body: Dict[str, Any]):
+    """
+    Record a completed episode's return and length for VL Norm statistics.
+    Body: {"episode_return": 0.72, "episode_length": 12}
+    """
+    episode_return = float(body.get("episode_return", 0.0))
+    episode_length = int(body.get("episode_length", 1))
+    _reward_normalizer.update(episode_return, episode_length)
+    normalized = _reward_normalizer.normalize(episode_return, episode_length)
+    return {
+        "normalized_return": normalized,
+        "stats": _reward_normalizer.to_dict(),
+    }
+
+
+class TRLRolloutRequest(BaseModel):
+    task_id: Optional[str] = None
+    seed: Optional[int] = None
+    actions: List[Dict[str, Any]]  # Pre-generated action sequence from LLM
+
+
+@app.post("/trl_rollout")
+async def trl_rollout(request: TRLRolloutRequest):
+    """
+    Run a full episode from a pre-generated action sequence.
+
+    Designed for TRL GRPOTrainer custom rollout_fn integration:
+    - Takes a sequence of LLM-generated actions
+    - Runs them through the environment
+    - Returns trajectory dict with per-step rewards and final score
+
+    This enables offline rollout: LLM generates all actions first,
+    then this endpoint evaluates them, matching TRL's batch-rollout pattern.
+
+    Body:
+      task_id: str (optional, random if not set)
+      seed: int (optional)
+      actions: [{action_type, line_number, filename, ...}, ...]
+
+    Returns:
+      trajectory: [{step, action, reward, feedback, done}]
+      episode_return: float (sum of step rewards)
+      final_score: float (terminal grade)
+      normalized_return: float (episode_return / num_steps)
+      state_features: [float] (12-dim feature vector at end of episode)
+    """
+    rollout_env = CodeReviewEnvironment()
+    obs = rollout_env.reset(task_id=request.task_id, seed=request.seed)
+
+    trajectory = []
+    episode_return = 0.0
+    final_score = 0.0
+
+    for step_idx, action_dict in enumerate(request.actions):
+        action = ReviewAction.from_dict(action_dict)
+        obs_step = rollout_env.step(action)
+        step_data = _serialize(obs_step)
+
+        reward = step_data.get("reward") or 0.0
+        episode_return += reward
+
+        trajectory.append({
+            "step": step_idx + 1,
+            "action": action_dict,
+            "reward": reward,
+            "reward_breakdown": step_data.get("reward_breakdown", {}),
+            "feedback": step_data.get("feedback", ""),
+            "current_score": step_data.get("current_score", 0.0),
+            "done": step_data.get("done", False),
+        })
+
+        if step_data.get("done", False):
+            final_score = step_data.get("reward", step_data.get("current_score", 0.0)) or 0.0
+            break
+
+    n_steps = max(len(trajectory), 1)
+    # Record in global normalizer for VL Norm statistics
+    _reward_normalizer.update(episode_return, n_steps)
+    normalized = _reward_normalizer.normalize(episode_return, n_steps)
+
+    # Get final state features
+    final_progress = rollout_env._compute_progress(rollout_env._task["max_steps"] if rollout_env._task else 20)
+
+    return {
+        "task_id": request.task_id,
+        "trajectory": trajectory,
+        "episode_return": round(episode_return, 4),
+        "final_score": round(final_score, 4),
+        "normalized_return": normalized,
+        "num_steps": n_steps,
+        "state_features": final_progress.get("state_features", []),
+        "final_progress": {k: v for k, v in final_progress.items() if k != "state_features"},
     }
 
 

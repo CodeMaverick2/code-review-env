@@ -1,11 +1,58 @@
 spec_version: 1
 name: code_review_env
-version: "1.0.0"
+version: "2.0.0"
 description: >
-  A code review and security audit environment for training AI agents.
+  A code review and security audit RL environment for training AI agents.
   The agent identifies bugs, security vulnerabilities, and performance issues
-  across three tasks of increasing difficulty (easy → medium → hard).
+  across 7 tasks of increasing difficulty (easy → medium → medium-hard → hard).
+  Features: PBRS reward shaping, graduated near-miss rewards, flood protection,
+  CAMRL curriculum selector, VL return normalization, and cross-language tasks.
 type: space
 runtime: fastapi
 app: server.app:app
+entry_point: server
 port: 7860
+
+tasks:
+  - id: bug-detection
+    difficulty: easy
+    language: python
+    num_issues: 3
+    max_steps: 15
+  - id: security-audit
+    difficulty: medium
+    language: python
+    num_issues: 7
+    max_steps: 20
+  - id: async-review
+    difficulty: medium-hard
+    language: python
+    num_issues: 6
+    max_steps: 20
+  - id: data-pipeline
+    difficulty: hard
+    language: python
+    num_issues: 7
+    max_steps: 25
+  - id: comprehensive-review
+    difficulty: hard
+    language: python
+    num_issues: 9
+    max_steps: 30
+  - id: api-security
+    difficulty: hard
+    language: python
+    num_issues: 8
+    max_steps: 25
+  - id: js-security
+    difficulty: hard
+    language: javascript
+    num_issues: 8
+    max_steps: 25
+
+reward_design:
+  terminal: "0.70 * F1 + 0.30 * severity_accuracy"
+  shaping: "PBRS (Ng et al. 1999): phi(s) = (tp/total_gt) * 0.5"
+  near_miss: "exponential decay: 0.10 * exp(-0.6 * (line_diff - 2))"
+  flood_protection: "escalating FP penalty after 3rd false positive"
+  normalization: "VL Norm (2025): normalized_return = cumulative / steps_used"
